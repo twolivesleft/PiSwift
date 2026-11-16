@@ -47,7 +47,8 @@ func toAnyJSONDocument(_ value: Any) -> AnyJSONDocument {
 
 func jsonString(from dict: [String: AnyCodable]) -> String {
     let jsonObject = dict.mapValues { $0.jsonValue }
-    if let data = try? JSONSerialization.data(withJSONObject: jsonObject, options: []),
+    // Arguments become model-visible text; keep replayed history stable for prompt caching.
+    if let data = try? JSONSerialization.data(withJSONObject: jsonObject, options: [.sortedKeys]),
        let string = String(data: data, encoding: .utf8) {
         return string
     }
