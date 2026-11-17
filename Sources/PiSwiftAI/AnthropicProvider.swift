@@ -139,10 +139,13 @@ func makeAnthropicUsage(
     )
 }
 
-public func streamAnthropic(
+/// One Messages request. `keepsContent` keeps the reply's wire blocks even when `content`
+/// models all of them, so a paused turn's continuation can be replayed with it.
+func streamAnthropicResponse(
     model: Model,
     context: TranscriptContext,
-    options: AnthropicOptions
+    options: AnthropicOptions,
+    keepsContent: Bool = false
 ) -> AssistantMessageEventStream {
     let model = resolveCloudflareModel(model, env: providerEnvironment(options.env))
     let compat = resolveAnthropicCompat(model: model)
@@ -248,9 +251,9 @@ public func streamAnthropic(
                     return AnthropicSystemInsertion(index: insertion.index, message: insertion.message,
                         toolDefinitions: definitions)
                 }
-                let encodedBody = try restoreAnthropicToolResultContent(
+                let encodedBody = try restoreAnthropicProviderContent(restoreAnthropicToolResultContent(
                     anthropicJSONBody(parameters), model: model, messages: context.messages
-                )
+                ), model: model, messages: context.messages)
                 let constrainedBody = injectAnthropicRequestBody(
                     body: encodedBody,
                     ttl: anthropicCacheTtl(baseUrl: model.baseUrl, supportsLongCacheRetention: compat.supportsLongCacheRetention,
@@ -390,6 +393,7 @@ public func streamAnthropic(
 
             var indexMap: [Int: Int] = [:]
             var toolCallPartials: [Int: ToolCallArgumentsStream] = [:]
+            var rawContent = AnthropicRawContent()
 
             for try await decodedEvent in anthropicStream {
                 if options.signal?.isCancelled == true {
@@ -424,6 +428,7 @@ public func streamAnthropic(
                     }
                 case .contentBlockStart:
                     guard let block = event.contentBlock, let index = event.index else { break }
+                    if let raw = decodedEvent.rawContentBlock?.value as? [String: Any] { rawContent.start(index: index, block: raw) }
                     switch block.type {
                     case "fallback":
                         if !output.content.isEmpty {
@@ -465,6 +470,9 @@ public func streamAnthropic(
                         break
                     }
                 case .contentBlockDelta:
+                    if let index = event.index, let raw = decodedEvent.rawDelta?.value as? [String: Any] {
+                        rawContent.apply(index: index, delta: raw)
+                    }
                     guard let index = event.index, let contentIndex = indexMap[index] else { break }
                     if let deltaType = event.delta?.type {
                         switch deltaType {
@@ -503,6 +511,7 @@ public func streamAnthropic(
                         }
                     }
                 case .contentBlockStop:
+                    if let index = event.index { rawContent.stop(index: index) }
                     guard let index = event.index, let contentIndex = indexMap[index] else { break }
                     switch output.content[contentIndex] {
                     case .text(let textBlock):
@@ -566,6 +575,11 @@ public func streamAnthropic(
                 throw AnthropicStreamError.apiError(output.errorMessage ?? "An unknown error occurred")
             }
 
+            if let content = rawContent.unmodeledContent
+                ?? (keepsContent || output.rawStopReason == "pause_turn" ? rawContent.content : nil) {
+                output.providerContent = AnyCodable(content)
+            }
+
             if let recordedThread, let recordedFullBody, let replyId = output.responseId,
                output.responseModel == nil {
                 let converted = convertAnthropicMessages(model: model, messages: [.assistant(output)],
@@ -575,8 +589,10 @@ public func streamAnthropic(
                 if let reply = converted.first,
                    let data = try? replyEncoder.encode(reply),
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    let reply = restoreAnthropicProviderContent(json,
+                        replies: anthropicProviderContentByResponse(model: model, messages: [.assistant(output)]))
                     try AnthropicMessageThreadStore.shared.record(recordedThread, model: model,
-                        fullBody: recordedFullBody, betas: recordedBetas, reply: json, replyId: replyId)
+                        fullBody: recordedFullBody, betas: recordedBetas, reply: reply, replyId: replyId)
                 }
             }
 
@@ -772,6 +788,8 @@ struct AnthropicDecodedMessageEvent {
     let servingModel: String?
     let cacheWrite1h: Int?
     let inputTransformations: [[String: AnyCodable]]?
+    let rawContentBlock: AnyCodable?
+    let rawDelta: AnyCodable?
 }
 
 private func decodeAnthropicMessageEvent(_ sse: AnthropicServerSentEvent) throws -> AnthropicDecodedMessageEvent? {
@@ -816,7 +834,9 @@ private func decodeAnthropicJSONEvent(_ json: String) throws -> AnthropicDecoded
         refusalExplanation: stopDetails?["explanation"] as? String,
         servingModel: message?["model"] as? String,
         cacheWrite1h: cacheCreation?["ephemeral_1h_input_tokens"] as? Int,
-        inputTransformations: transformations
+        inputTransformations: transformations,
+        rawContentBlock: contentBlock.map(AnyCodable.init),
+        rawDelta: delta.map(AnyCodable.init)
     )
 }
 
@@ -1218,8 +1238,10 @@ private func convertAnthropicMessages(
                 params.append(MessageParameter.Message(role: .user, content: content))
             }
         case .assistant(let assistant):
-            let contentObjects = convertAssistantContent(assistant, isOAuthToken: isOAuthToken,
-                allowEmptySignature: model.compat?.allowEmptySignature == true)
+            let contentObjects = anthropicProviderContent(assistant, model: model) != nil
+                ? [.text(anthropicProviderContentPlaceholder(assistant))]
+                : convertAssistantContent(assistant, isOAuthToken: isOAuthToken,
+                    allowEmptySignature: model.compat?.allowEmptySignature == true)
             if !contentObjects.isEmpty {
                 flushSystemMessages()
                 params.append(MessageParameter.Message(role: .assistant, content: .list(contentObjects)))
